@@ -281,4 +281,40 @@ function mapreduce_sequential(f, args, num_workers, merge, unit)
   return reduce(merge, ys, init=unit)
 end
 
+####
+#### Memory usage debugging
+####
+
+module Debug
+
+using Crayons
+import CUDA
+
+function memstatus(legend)
+  if get(ENV, "DEBUG_CUDA_MEMORY_STATUS", "") == "true"
+    println("")
+    flush(stdout)
+    println(crayon"green bold", "* ", legend, crayon"reset")
+    flush(stdout)
+    if get(ENV, "DEBUG_CUDA_MEMORY_STATUS_CALL_GC", "") == "true"
+      println(crayon"green", "* Before GC", crayon"reset")
+      flush(stdout)
+      CUDA.memory_status()
+      flush(stdout)
+      GC.gc()
+      println(crayon"green", "* After GC", crayon"reset")
+      flush(stdout)
+      CUDA.memory_status()
+      flush(stdout)
+    else
+      CUDA.memory_status()
+      flush(stdout)
+    end
+    println("")
+    flush(stdout)
+  end
+end
+
+end
+
 end

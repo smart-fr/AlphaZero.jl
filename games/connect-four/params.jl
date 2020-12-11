@@ -1,7 +1,7 @@
 Network = NetLib.ResNet
 
 netparams = NetLib.ResNetHP(
-  num_filters=128,
+  num_filters=64,
   num_blocks=5,
   conv_kernel_size=(3, 3),
   num_policy_head_filters=32,

@@ -121,8 +121,10 @@ end
 function batch_updates!(tr::Trainer, n)
   L(batch...) = losses(tr.network, tr.params, tr.Wmean, tr.Hp, batch)[1]
   data = Iterators.take(tr.batches_stream, n)
+  Util.Debug.memstatus("After creating batch data and before calling train")
   ls = Vector{Float32}()
   Network.train!(tr.network, tr.params.optimiser, L, data, n) do i, l
+    Util.Debug.memstatus("Batch $i")
     push!(ls, l)
   end
   Network.gc(tr.network)

@@ -204,6 +204,7 @@ function learning_step!(env::Env, handler)
     # Skipping the learning phase
     return dummy_learning_report()
   end
+  Util.Debug.memstatus("Mem state before Trainer")
   trainer, tconvert = @timed Trainer(env.gspec, env.curnn, experience, lp)
   init_status = learning_status(trainer)
   Handlers.learning_started(handler, init_status)
@@ -321,8 +322,11 @@ function train!(env::Env, handler=nothing)
   while env.itc < env.params.num_iters
     Handlers.iteration_started(handler)
     resize_memory!(env, env.params.mem_buffer_size[env.itc])
+    Util.Debug.memstatus("Mem state BEFORE self play")
     sprep, spperfs = Report.@timed self_play_step!(env, handler)
+    Util.Debug.memstatus("Mem state AFTER self play")
     mrep, mperfs = Report.@timed memory_report(env, handler)
+    Util.Debug.memstatus("Mem state AFTER mem report")
     lrep, lperfs = Report.@timed learning_step!(env, handler)
     rep = Report.Iteration(spperfs, mperfs, lperfs, sprep, mrep, lrep)
     env.itc += 1

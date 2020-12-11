@@ -182,4 +182,11 @@ module AlphaZero
   include("scripts/scripts.jl")
   export Scripts
 
+  defenv(var, val) = haskey(ENV, var) || (ENV[var] = val)
+
+  function __init__()
+    defenv("DEBUG_CUDA_MEMORY_STATUS", "true")
+    defenv("DEBUG_CUDA_MEMORY_STATUS_CALL_GC", "true")
+  end
+
 end
