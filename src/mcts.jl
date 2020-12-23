@@ -170,6 +170,16 @@ function state_info(env, state)
     return (env.tree[state], false)
   else
     (P, V) = env.oracle(state)
+    game = GI.init(env.gspec, state)
+    if length(GI.available_actions(game)) != length(P)
+      # Something abnormal happened
+      println("PROBLEM DETECTED")
+      println("State:")
+      GI.render(game)
+      @show P
+      @show GI.available_actions(game)
+      @assert false
+    end
     info = init_state_info(P, V, env.prior_temperature)
     env.tree[state] = info
     return (info, true)
