@@ -18,8 +18,31 @@ const Cell = UInt8
 const EMPTY = 0x00
 const Board = SMatrix{NUM_COLS, NUM_ROWS, Cell, NUM_CELLS}
 
+
+# An alternative initial state for debugging purposes
+function test_state(nrows=4)
+  board = @SMatrix [
+    r <= nrows ?
+      (r % 4 < 2 && c % 2 == 1 || r % 4 >= 2 && c % 2 == 0 ? WHITE : BLACK) :
+      EMPTY
+    for c in 1:NUM_COLS, r in 1:NUM_ROWS]
+  curplayer=WHITE
+  return (board=board, curplayer=curplayer)
+end
+
+function test_state_three_cols(cols=[2, 4, 6])
+  board = @SMatrix [
+    c ∈ [2, 4, 6] && r <= 4 ?
+      (c == 4 && r % 2 == 1 || c != 4 && r % 2 == 0 ? WHITE : BLACK) :
+      EMPTY
+    for c in 1:NUM_COLS, r in 1:NUM_ROWS]
+  curplayer=WHITE
+  return (board=board, curplayer=curplayer)
+end
+
 const INITIAL_BOARD = @SMatrix zeros(Cell, NUM_COLS, NUM_ROWS)
-const INITIAL_STATE = (board=INITIAL_BOARD, curplayer=WHITE)
+# const INITIAL_STATE = (board=INITIAL_BOARD, curplayer=WHITE)
+const INITIAL_STATE = test_state()
 
 # TODO: we could have the game parametrized by grid size.
 struct GameSpec <: GI.AbstractGameSpec end
