@@ -9,5 +9,5 @@ for i in {1..100}
 do
   echo -e "${BLUE}Running experiment #$i${NC}"
   rm -rf sessions
-  julia --project --color=yes -t 1 -e 'using AlphaZero; Scripts.train("connect-four")' 2>&1 | tee rep/out/$i.log
+  julia --project --color=yes -t 6 -e 'using AlphaZero; Scripts.train("connect-four")' 2>&1 | tee rep/out/$i.log
 done
