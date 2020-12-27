@@ -121,7 +121,7 @@ function update_actions_mask!(g::GameEnv)
   end
 end
 
-GI.actions_mask(g::GameEnv) = g.amask
+GI.actions_mask(g::GameEnv) = copy(g.amask)
 
 valid_pos((col, row)) = 1 <= col <= NUM_COLS && 1 <= row <= NUM_ROWS
 
