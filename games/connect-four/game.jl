@@ -52,7 +52,6 @@ mutable struct GameEnv <: GI.AbstractGameEnv
   curplayer :: Player
   finished :: Bool
   winner :: Player
-  amask :: Vector{Bool} # actions mask
   # Actions history, which uniquely identifies the current board position
   # Used by external solvers
   history :: Union{Nothing, Vector{Int}}
@@ -65,17 +64,15 @@ function GI.init(::GameSpec)
   curplayer = INITIAL_STATE.curplayer
   finished = false
   winner = 0x00
-  amask = trues(NUM_COLS)
   history = Int[]
-  return GameEnv(board, curplayer, finished, winner, amask, history)
+  return GameEnv(board, curplayer, finished, winner, history)
 end
 
 function GI.set_state!(g::GameEnv, state)
   g.history = nothing
   g.board = state.board
   g.curplayer = state.curplayer
-  update_actions_mask!(g)
-  any(g.amask) || (g.finished = true)
+  any(GI.actions_mask(g)) || (g.finished = true)
   for col in 1:NUM_COLS
     top = first_free(g.board, col)
     top == 1 && continue
@@ -98,7 +95,7 @@ GI.actions(::GameSpec) = ACTIONS
 
 function GI.clone(g::GameEnv)
   history = isnothing(g.history) ? nothing : copy(g.history)
-  GameEnv(g.board, g.curplayer, g.finished, g.winner, copy(g.amask), history)
+  GameEnv(g.board, g.curplayer, g.finished, g.winner, history)
 end
 
 history(g::GameEnv) = g.history
@@ -115,13 +112,11 @@ function first_free(board, col)
   return row
 end
 
-function update_actions_mask!(g::GameEnv)
-  g.amask = map(ACTIONS) do col
+function GI.actions_mask(g::GameEnv)
+  return map(ACTIONS) do col
     first_free(g.board, col) <= NUM_ROWS
   end
 end
-
-GI.actions_mask(g::GameEnv) = copy(g.amask)
 
 valid_pos((col, row)) = 1 <= col <= NUM_COLS && 1 <= row <= NUM_ROWS
 
@@ -151,12 +146,11 @@ end
 
 # Update the game status assuming g.curplayer just played at pos=(col, row)
 function update_status!(g::GameEnv, pos)
-  update_actions_mask!(g)
   if winning_pattern_at(g.board, g.curplayer, pos)
     g.winner = g.curplayer
     g.finished = true
   else
-    g.finished = !any(g.amask)
+    g.finished = !any(GI.actions_mask(g))
   end
 end
 
