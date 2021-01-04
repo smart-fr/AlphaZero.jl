@@ -2,21 +2,35 @@
 ##### Utilities to manage inference servers
 #####
 
+function check_batch(gspec, batch, res)
+  for (b, (P, V)) in Iterators.zip(batch, res)
+    g = GI.init(gspec, b)
+    @assert length(P) == length(GI.available_actions(g))
+  end
+end
+
+#Note: this function modifies batch in place, although this does not seem to be a problem.
 function fill_and_evaluate(net, batch; batch_size, fill)
+  old_batch = deepcopy(batch)
   n = length(batch)
   @assert n > 0
   if !fill
-    return Network.evaluate_batch(net, batch)
+    res = Network.evaluate_batch(net, batch)
   else
+    #@assert false "We should not be filling batches"
     nmissing = batch_size - n
     @assert nmissing >= 0
     if nmissing == 0
-      return Network.evaluate_batch(net, batch)
+      res = Network.evaluate_batch(net, batch)
     else
-      append!(batch, [batch[1] for _ in 1:nmissing])
-      return Network.evaluate_batch(net, batch)[1:n]
+      #append!(batch, [batch[1] for _ in 1:nmissing])
+      filled_batch = vcat(batch, [batch[1] for _ in 1:nmissing])
+      res = Network.evaluate_batch(net, filled_batch)[1:n]
     end
   end
+  @assert length(batch) == length(res)
+  check_batch(net.gspec, batch, res)
+  return res
 end
 
 # Start a server that processes inference requests for TWO networks
