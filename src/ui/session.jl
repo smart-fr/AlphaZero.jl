@@ -275,6 +275,8 @@ function zeroth_iteration!(session::Session)
   Log.section(session.logger, 2, "Initial report")
   print_report(session.logger, initial_report(session.env))
   bench = run_benchmark(session)
+  println("Benchmark ran successfully: exiting")
+  exit()
   save_increment!(session, bench)
 end
 
