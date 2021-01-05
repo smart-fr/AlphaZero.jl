@@ -9,5 +9,6 @@ for i in {1..100}
 do
   echo -e "${BLUE}Running experiment #$i${NC}"
   rm -rf sessions
-  julia --project --color=yes -t 6 scripts/alphazero.jl --game tictactoe train 2>&1 | tee rep/out/$i.log
+  export JULIA_NUM_THREADS=6
+  julia --project --color=yes scripts/alphazero.jl --game tictactoe train 2>&1 | tee rep/out/$i.log
 done
