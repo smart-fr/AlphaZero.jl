@@ -85,7 +85,9 @@ struct Player <: AbstractPlayer
 end
 
 function AlphaZero.think(p::Player, game)
-  actions = GI.available_actions(game)
+  # actions = GI.available_actions(game)
+  # Customized in order to use a heuristic
+  actions = GI.available_actions(game, true)
   n = length(actions)
   qs = [qvalue(p, game, a, p.depth) for a in actions]
   winning = findall(==(Inf), qs)
