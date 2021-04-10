@@ -6,11 +6,15 @@ using StaticArrays
 const BOARD_SIDE = 16
 const NUM_CELLS = Int(BOARD_SIDE) ^ 2
 const TO_CONQUER = 0.875
+const EXPAND_PERIOD = 20
+const MAX_EXPANSIONS = 8
 # Initial board as a list of bonbon notations
 const INITIAL_BOARD_SIZE_16_LIST = [
   "00037", "0083B", "04073", "08CBF", "0C4F7", "0C8FF",
   "10C7F", "144BB", "180F3"
 ]
+
+const USE_HEURISTIC = true
 
 const Player = UInt8
 const WHITE = 0x01
@@ -18,11 +22,12 @@ const BLACK = 0x02
 other_player(p::Player) = 0x03 - p
 
 const Cell = UInt8
-const EMPTY_BOARD = @SMatrix zeros(Cell, BOARD_SIDE, BOARD_SIDE)
-const Board = typeof(EMPTY_BOARD)
-const EMPTY_ACTIONS_HOOK = @SMatrix [(-1, -1) for row in 1:BOARD_SIDE, column in 1:BOARD_SIDE]
-const ActionsHook = typeof(EMPTY_ACTIONS_HOOK)
-const EMPTY_STATE = (board=EMPTY_BOARD, actions_hook=EMPTY_ACTIONS_HOOK, curplayer=WHITE)
+const ZERO_BOARD = @SMatrix zeros(Cell, BOARD_SIDE, BOARD_SIDE)
+const Board = typeof(ZERO_BOARD)
+const EMPTY_TUPLE = @SMatrix [(-1, -1) for row in 1:BOARD_SIDE, column in 1:BOARD_SIDE]
+const ZERO_TUPLE = @SMatrix [(0, 0) for row in 1:BOARD_SIDE, column in 1:BOARD_SIDE]
+const BoardTuple = typeof(EMPTY_TUPLE)
+const EMPTY_STATE = (board=ZERO_BOARD, impact=ZERO_TUPLE, actions_hook=EMPTY_TUPLE, curplayer=WHITE)
 
 struct GameSpec <: GI.AbstractGameSpec end
 
@@ -37,10 +42,11 @@ mutable struct GameEnv <: GI.AbstractGameEnv
   amask_black :: Vector{Bool}
   # Cell indices of NW corner of bonbon where current cell belongs,
   # where all legal actions for the bonbon are flagged in GameEnv.amask
-  actions_hook :: ActionsHook
+  actions_hook :: BoardTuple
   # Actions history, which uniquely identifies the current board position
   # Used by external solvers and to trigger expansions through turns count
   history :: Union{Nothing, Vector{Int}}
+  impact :: BoardTuple
 end
 
 GI.spec(::GameEnv) = GameSpec()
@@ -116,17 +122,9 @@ cell_value_is_empty(cell_value::Cell) = !cell_value_is_white(cell_value) && !cel
 # returns the return of "test_function applied" to the corresponding cell value in the board.
 test_board_column_row(test_function) = (board, column, row) -> (0 <= column < BOARD_SIDE) && (0 <= row < BOARD_SIDE) && test_function(board[row + 1, column + 1])
 test_out_or_board_column_row(test_function) = (board, column, row) -> !(0 <= column < BOARD_SIDE) || !(0 <= row < BOARD_SIDE) || test_function(board[row + 1, column + 1])
-# function test_board_column_row(test_function)
-#   return function(board, column, row)
-#     return (0 <= column < BOARD_SIDE) && (0 <= row < BOARD_SIDE) && test_function(board[row + 1, column + 1])
-#   end
-# end
 #
 # Applications
 is_former_fighter = test_board_column_row(cell_value_is_former_fighter)
-#function has_N_border(board::Board, column, row)
-#  return cell_value_has_N_border(board[row + 1, column + 1])
-#end
 has_N_border = test_board_column_row(cell_value_has_N_border)
 has_S_border = test_board_column_row(cell_value_has_S_border)
 has_W_border = test_board_column_row(cell_value_has_W_border)
@@ -286,11 +284,10 @@ GI.actions(::GameSpec) = ACTIONS
 # Create the initial board object based on a list of  bonbons
 # described in an array of bonbon notations
 ###
-function bonbons_list_to_state(bonbons::Array, curplayer)
-  board = Array(EMPTY_BOARD)
-  actions_hook = Array(EMPTY_ACTIONS_HOOK)
+function bonbons_list_to_board(bonbons::Array)
+  board = Array(ZERO_BOARD)
   try
-    # Iterate on the array of bonbon notations
+    # Iterate on the array of bonbon notations to read borders and colors
     for bonbon in bonbons
       if length(bonbon) != 5
         return nothing
@@ -300,6 +297,7 @@ function bonbons_list_to_state(bonbons::Array, curplayer)
         north = parse(Int, bonbon[3], base=16)
         east = parse(Int, bonbon[4], base=16)
         south = parse(Int, bonbon[5], base=16)
+        team = bonbon[1] == '0' ? WHITE : BLACK
         # Add corresponding bits to bonbon interior and limit cells
         # NB. Columns and rows are expressed in a 0-based conceptual matrix
         #     whereas board is a 1-based Julia matrix
@@ -324,148 +322,84 @@ function bonbons_list_to_state(bonbons::Array, curplayer)
               add_N_border(board, column, row + 1)
             end
             # Add team bit to bonbon cells
-            bonbon[1] == '0' ? set_white(board, column, row) : set_black(board, column, row)
-            # Set actions hook of all bonbon cells to bonbon's NW corner
-            actions_hook[row + 1, column + 1] = (west, north)
+            if team == WHITE
+              set_white(board, column, row)
+            else
+              set_black(board, column, row)
+            end
           end
         end
       end
     end
-    # Return the State object
-    return (board=Board(board), actions_hook=ActionsHook(actions_hook), curplayer=curplayer)
+    # Return the board
+    return Board(board)
   catch
     return nothing
   end
 end
 #
+const INITIAL_BOARD = bonbons_list_to_board(INITIAL_BOARD_SIZE_16_LIST)
 
-###################################
-# GAMES                           #
-###################################
-#
-# Create a game environment with initial conditions
-function GI.init(::GameSpec)
-  # s = bonbons_list_to_state(INITIAL_BOARD_SIZE_16_LIST, WHITE)
-  s = read_state(["25.00 05.00 05.00 0d.00 25.40 05.40 05.40 0d.40 26.80 06.80 06.80 06.80 06.80 06.80 06.80 0e.80",
-    "21.00 01.00 01.00 09.00 21.40 01.40 01.40 09.40 22.80 02.80 02.80 02.80 02.80 02.80 02.80 0a.80",
-    "21.00 01.00 01.00 09.00 21.40 01.40 01.40 09.40 22.80 02.80 02.80 02.80 02.80 02.80 02.80 0a.80",
-    "21.00 01.00 01.00 09.00 31.40 11.40 11.40 19.40 32.80 12.80 12.80 12.80 12.80 12.80 12.80 1a.80",
-    "21.00 01.00 01.00 09.00 26.44 06.44 06.44 06.44 06.44 06.44 06.44 0e.44 25.c4 05.c4 05.c4 0d.c4",
-    "21.00 01.00 01.00 09.00 22.44 02.44 02.44 02.44 02.44 02.44 02.44 0a.44 21.c4 01.c4 01.c4 09.c4",
-    "21.00 01.00 01.00 09.00 22.44 02.44 02.44 02.44 02.44 02.44 02.44 0a.44 21.c4 01.c4 01.c4 09.c4",
-    "31.00 11.00 11.00 19.00 22.44 02.44 02.44 02.44 02.44 02.44 02.44 0a.44 31.c4 11.c4 11.c4 19.c4",
-    "25.08 05.08 05.08 0d.08 22.44 02.44 02.44 02.44 02.44 02.44 02.44 0a.44 25.c8 05.c8 05.c8 0d.c8",
-    "21.08 01.08 01.08 09.08 22.44 02.44 02.44 02.44 02.44 02.44 02.44 0a.44 21.c8 01.c8 01.c8 09.c8",
-    "21.08 01.08 01.08 09.08 22.44 02.44 02.44 02.44 02.44 02.44 02.44 0a.44 21.c8 01.c8 01.c8 09.c8",
-    "31.08 11.08 11.08 19.08 32.44 12.44 12.44 12.44 12.44 12.44 12.44 1a.44 21.c8 01.c8 01.c8 09.c8",
-    "26.0c 06.0c 06.0c 06.0c 06.0c 06.0c 06.0c 0e.0c 25.8c 05.8c 05.8c 0d.8c 21.c8 01.c8 01.c8 09.c8",
-    "22.0c 02.0c 02.0c 02.0c 02.0c 02.0c 02.0c 0a.0c 21.8c 01.8c 01.8c 09.8c 21.c8 01.c8 01.c8 09.c8",
-    "22.0c 02.0c 02.0c 02.0c 02.0c 02.0c 02.0c 0a.0c 21.8c 01.8c 01.8c 09.8c 21.c8 01.c8 01.c8 09.c8",
-    "32.0c 12.0c 12.0c 12.0c 12.0c 12.0c 12.0c 1a.0c 31.8c 11.8c 11.8c 19.8c 31.c8 11.c8 11.c8 19.c8"
-    ], "Pink")
-  board = s.board
-  curplayer = s.curplayer
-  actions_hook = s.actions_hook
-  amask_white = string_to_booleans("62000000000000006e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000670000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006b0000006800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
-  amask_black = string_to_booleans("00000000000000000000000064000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
-  amask = amask_white
-  finished = false
-  winner = 0x00
-  g = GameEnv(board, curplayer, finished, winner, amask, amask_white, amask_black, actions_hook, nothing)
-  return g
-end
-#
-# Set a given state. Consistency is ensured by updating the status.
-function GI.set_state!(g::GameEnv, s)
-  g.board = s.board
-  g.curplayer = s.curplayer
-  g.actions_hook = s.actions_hook
-  g.amask_white = []
-  g.amask_black = []
-  g.amask = amask_white
-  g.finished = false
-  g.winner = 0x00
-  g.history = nothing
-  update_status!(g)
-  return g
-end
-#
-GI.actions_mask(g::GameEnv) = g.amask
-GI.two_players(::GameSpec) = true
-GI.current_state(g::GameEnv) = (board=g.board, actions_hook=g.actions_hook, curplayer=g.curplayer)
-GI.white_playing(g::GameEnv) = g.curplayer == WHITE
-
-#
-function GI.clone(g::GameEnv)
-  history = isnothing(g.history) ? nothing : copy(g.history)
-  GameEnv(g.board, g.curplayer, g.finished, g.winner, copy(g.amask), copy(g.amask_white), copy(g.amask_black), copy(g.actions_hook), history)
-end
-#
-###
-# Reward shaping
-###
-#
-function GI.game_terminated(g::GameEnv)
-  return g.finished
-end
-#
-function GI.white_reward(g::GameEnv)
-  if g.finished
-    g.winner == WHITE && (return  1.)
-    g.winner == BLACK && (return -1.)
-    return 0.
-  else
-    return 0.
-  end
-end
 
 ###################################
 # GAME RULES                      #
 ###################################
 #
-###
-# Return a 8-long boolean array to flag legal actions among all potential ones for
-# a given board and originating bonbon with NW corner at provided column and row.
-###
-# The position of True values in the returned array and the subsequent value of a binary encoding
-# of this boolean series are illustrated below.
-# -----------------------
-# *W *S *E *N /W /S /E /N
-#  8  4  2  1  8  4  2  1 (legend for encoding the value of 1 action)
-#  8  7  6  5  4  3  2  1 (legend for the binary vector encoding all possible actions for a bonbon)
-# -----------------------
-#           1           1
-#        2           2   
-#        3  3        3  3
-#     4           4      
-#     5     5     5     5
-#     6  6        6  6   
-#     7  7  7     7  7  7
-#  8           8         
-#  9        9  9        9
-#  A     A     A     A   
-#  B     B  B  B     B  B
-#  C  C        C  C      
-#  D  D     D  D  D     D
-#  E  E  E     E  E  E   
-#  F  F  F  F  F  F  F  F
-# -----------------------
-# *W *S *E *N /W /S /E /N
-#  8  7  6  5  4  3  2  1 (legend for the binary vector encoding all possible actions for a bonbon)
-#  8  4  2  1  8  4  2  1 (legend for encoding the value of 1 action)
-# -----------------------
-#
-function legal_actions_boolean_mask_from_NW_of_origin(board::Board, column, row)
+#=
+Compute cell contribution to state properties which depend on the board data only.
+Modify the actions hook and impact tables during the process.
+Returns the legal actions attached to this cell, i.e. a 8-long boolean array to flag possible actions
+from the point of view of the originating bonbon, if this cell is its NW corner.
+The position of True values in the returned array and the subsequent value of a binary encoding
+of this boolean series are illustrated below.
+-----------------------
+*W *S *E *N /W /S /E /N
+ 8  4  2  1  8  4  2  1 (legend for encoding the value of 1 action)
+ 8  7  6  5  4  3  2  1 (legend for the binary vector encoding all possible actions for a bonbon)
+-----------------------
+          1           1
+       2           2   
+       3  3        3  3
+    4           4      
+    5     5     5     5
+    6  6        6  6   
+    7  7  7     7  7  7
+ 8           8         
+ 9        9  9        9
+ A     A     A     A   
+ B     B  B  B     B  B
+ C  C        C  C      
+ D  D     D  D  D     D
+ E  E  E     E  E  E   
+ F  F  F  F  F  F  F  F
+-----------------------
+*W *S *E *N /W /S /E /N
+ 8  7  6  5  4  3  2  1 (legend for the binary vector encoding all possible actions for a bonbon)
+ 8  4  2  1  8  4  2  1 (legend for encoding the value of 1 action)
+-----------------------
+=#
+function compute_cell_legal_actions_update_actions_hook_impact!(board::Board, column, row, actions_hook::Array, impact:: Array)
   if !(0 <= column < BOARD_SIDE) || !(0 <= row < BOARD_SIDE)
     return nothing
   end
-  # No legal actions for cells either empty or with neither a North border nor a West border.
-  if is_empty(board, column, row) || !has_N_border(board, column, row) || !has_W_border(board, column, row)
+  if is_empty(board, column, row)
+    # Cell is empty => No legal actions, actions_hook undefined, empty impact.
+    actions_hook[row + 1, column + 1] = (-1, -1)
+    impact[row + 1, column + 1] = (0, 0)
+    return falses(NUM_ACTIONS_PER_CELL)
+  elseif !has_N_border(board, column, row) || !has_W_border(board, column, row)
+    # Cell has no North border or no West border => No legal actions, empty impact, actions_hook was defined when
+    # the NW corner of this bonbon was visited.
+    impact[row + 1, column + 1] = (0, 0)
     return falses(NUM_ACTIONS_PER_CELL)
   end
+  # (column, row) cell is a NW corner.
   # Initialize permissions
   can_fuse_N = can_fuse_E = can_fuse_S = can_fuse_W = true
   can_divide_N = can_divide_E = can_divide_S = can_divide_W = false
+  # Initialize impact setup
+  frontline = 0
+  is_opponent = is_white(board, column, row) ? is_black : is_white
   # Is bonbon a former figher?
   bonbon_is_former_fighter = is_former_fighter(board, column, row)
   # Check if bonbon has a North neighbor and both aren't former fighters
@@ -474,8 +408,10 @@ function legal_actions_boolean_mask_from_NW_of_origin(board::Board, column, row)
   end
   # Check the North border of the bonbon until the NE corner is reached
   last_column = column
+  frontline += is_opponent(board, last_column, row - 1) ? 1 : 0
   while !has_E_border(board, last_column, row)
     last_column += 1
+    frontline += is_opponent(board, last_column, row - 1) ? 1 : 0
     # If a cell has an vertical border then fusing to the North isn't legal
     if has_W_border(board, last_column, row - 1)
       can_fuse_N = false
@@ -488,8 +424,10 @@ function legal_actions_boolean_mask_from_NW_of_origin(board::Board, column, row)
   end
   # Check the East border of the bonbon until the SE corner is reached
   last_row = row
+  frontline += is_opponent(board, last_column + 1, last_row) ? 1 : 0
   while !has_S_border(board, last_column, last_row)
     last_row += 1
+    frontline += is_opponent(board, last_column + 1, last_row) ? 1 : 0
     # If a cell has an horizontal border then fusing to the East isn't legal
     if has_N_border(board, last_column + 1, last_row)
       can_fuse_E = false
@@ -499,25 +437,27 @@ function legal_actions_boolean_mask_from_NW_of_origin(board::Board, column, row)
   # Check if bonbon has a South neighbor and both aren't former fighters
   if is_empty(board, last_column, last_row + 1) || bonbon_is_former_fighter && is_former_fighter(board, last_column, last_row + 1)
     can_fuse_S = false
-  else
-    # Check the South border of the bonbon
-    for i in column + 1:last_column
-      # If a cell has an vertical border then fusing to the South isn't legal
-      if has_W_border(board, i, last_row + 1)
-        can_fuse_S = false
-      end
+  end
+  # Check the South border of the bonbon
+  frontline += is_opponent(board, column, last_row + 1) ? 1 : 0
+  for i in column + 1:last_column
+    frontline += is_opponent(board, i, last_row + 1) ? 1 : 0
+    # If a cell has an vertical border then fusing to the South isn't legal
+    if has_W_border(board, i, last_row + 1)
+      can_fuse_S = false
     end
   end
   # Check if bonbon has a West neighbor and both aren't former fighters
   if is_empty(board, column - 1, row) || bonbon_is_former_fighter && is_former_fighter(board, column - 1, row)
     can_fuse_W = false
-  else
-    # Check the West border of the bonbon
-    for i in row + 1:last_row
-      # If a cell has an horizontal border then fusing to the West isn't legal
-      if has_N_border(board, column - 1, i)
-        can_fuse_W = false
-      end
+  end
+  # Check the West border of the bonbon
+  frontline += is_opponent(board, column - 1, row) ? 1 : 0
+  for i in row + 1:last_row
+    frontline += is_opponent(board, column - 1, i) ? 1 : 0
+    # If a cell has an horizontal border then fusing to the West isn't legal
+    if has_N_border(board, column - 1, i)
+      can_fuse_W = false
     end
   end
   # Check legal division moves
@@ -535,37 +475,49 @@ function legal_actions_boolean_mask_from_NW_of_origin(board::Board, column, row)
     # ie difference is even
     can_divide_W = (column - last_column) % 2 == 0
   end
-  # Return legal actions mask
+  # Update actions_hook for all cells in the bonbon
+  for c in column:last_column
+    for r in row:last_row
+      actions_hook[r + 1, c + 1] = (column, row)
+    end
+  end
+  # Store the impact
+  centrality = round((BOARD_SIDE - (abs(column + last_column - BOARD_SIDE + 1) / 2 + abs(row + last_row - BOARD_SIDE + 1) / 2)) * 6)
+  impact[row + 1, column + 1] = (frontline , centrality)
+  # Return cell's legal actions mask
   return [can_divide_N, can_divide_E, can_divide_S, can_divide_W, can_fuse_N, can_fuse_E, can_fuse_S, can_fuse_W]
 end
-  #
-function update_players_actions_masks!(g::GameEnv)
-  g.amask_white = []
-  g.amask_black = []
+#
+# Compute state properties which depend on the board data only
+function compute_actions_masks_actions_hooks_impact(b::Board)
+  amask_white = []
+  amask_black = []
+  actions_hook = Array(EMPTY_TUPLE)
+  impact = Array(ZERO_TUPLE)
   try
-    # Iterate on cells to merge all legal actions mask
     for column in 0:BOARD_SIDE - 1
       for row in 0:BOARD_SIDE - 1
-        cell_amask = legal_actions_boolean_mask_from_NW_of_origin(g.board, column, row)
-        if is_white(g.board, column, row)
-          append!(g.amask_white, cell_amask)
-          append!(g.amask_black, falses(NUM_ACTIONS_PER_CELL))
+        cell_amask = compute_cell_legal_actions_update_actions_hook_impact!(b, column, row, actions_hook, impact)
+        if is_white(b, column, row)
+          append!(amask_white, cell_amask)
+          append!(amask_black, falses(NUM_ACTIONS_PER_CELL))
         else
-          append!(g.amask_black, cell_amask)
-          append!(g.amask_white, falses(NUM_ACTIONS_PER_CELL))
+          append!(amask_black, cell_amask)
+          append!(amask_white, falses(NUM_ACTIONS_PER_CELL))
         end
       end
     end
-  catch
-    println("Error in update_actions_mask!(g::GameEnv)")
-    g.amask_white = nothing
-    g.amask_black = nothing
+    return (amask_white, amask_black, BoardTuple(actions_hook), BoardTuple(impact))
+  catch e
+    println("Error in compute_actions_masks_actions_hooks_impact(b::Board)")
+    println("Exception ", e)
+    return nothing
   end
 end
 #
 # Update the game status
 function update_status!(g::GameEnv)
-  update_players_actions_masks!(g)
+  (g.amask_white, g.amask_black, g.actions_hook, g.impact) = compute_actions_masks_actions_hooks_impact(g.board)
   g.amask = (g.curplayer == WHITE ? g.amask_white : g.amask_black)
   if any(g.amask)
     white_ratio = GI.heuristic_value(g)
@@ -585,7 +537,6 @@ end
 
 function GI.play!(g::GameEnv, action)
   board = Array(g.board)
-  actions_hook = Array(g.actions_hook)
   # Define functions to move a cursor around the board
   step_N = (column, row) -> (column, row - 1)
   step_S = (column, row) -> (column, row + 1)
@@ -594,7 +545,7 @@ function GI.play!(g::GameEnv, action)
   # Unset former fighter bit for the whole board
   board = map(cell_value_unset_former_fighter, board)
   # Perform action on g
-  if 0 <= action <= 2047
+  if 0 <= action < NUM_ACTIONS_PER_CELL * NUM_CELLS
     try
       isnothing(g.history) || push!(g.history, action)
       (column, row) = (NW_column, NW_row) = index_to_column_row(action ÷ NUM_ACTIONS_PER_CELL + 1)
@@ -781,23 +732,24 @@ function GI.play!(g::GameEnv, action)
           remove_opening_border_in_action_direction = remove_E_border
         end
         # Apply the general fusion algorithm, starting from NW corner of origin bonbon
-        # ┼────────────────────────────┼          ┼────────────────────────────┼
-        # │                     Corner1│          │                     Corner2│
-        # │      Dest                 ^│          │        Dest               ^│
-        # │     (up or left)          ^3          │       (down or right)     ^7
-        # │                           ^│          │Final                      ^│
-        # │<<<<<<<4<<<<<<<<<┼----4-----┼────1─────┼-----8----┼>>>>>>>>6>>>>>>>>│
+        # ┼────────────────────────────┼          ┼──────────┼>>>>>>>>6>>>>>>>>┼
+        # │                     Corner1│          │          ^          Corner2│
+        # │      Dest                 ^│          │          ^                 │
+        # │     (up or left)          ^3          │          6                 │
+        # │                           ^│          │Final     ^                 │
+        # │<<<<<<<4<<<<<<<<<┼----4-----┼────1─────┼-----8----┼>>>>>>>>7>>>>>>>>│
         # │ProjPiv1    Pivot¦P1<<<<<<<B│NW>>>>>>>>│<<<<<<<<P2¦Pivot    ProjPiv2│
         # │                 5v         │  Origin v2         5^                 │
         # │ProjPiv2    Pivot¦P2>>>>>>>>│        SE│B>>>>>>>P1¦Pivot    ProjPiv1│
-        # │<<<<<<<6<<<<<<<<<┼----8-----┼──────────┼-----4----┼>>>>>>>>4>>>>>>>>│
-        # │v                      Final│          │v                           │
-        # 7v                           │          │v                           │
-        # │v                           │          3v                           │
-        # │Corner2                     │          │Corner1                     │
-        # ┼────────────────────────────┼          ┼────────────────────────────┼
+        # │<<<<<<<7<<<<<<<<<┼----8-----┼──────────┼-----4----┼>>>>>>>>4>>>>>>>>│
+        # │                 v     Final│          │v                           │
+        # │                 6          │          │v          Dest             │
+        # │                 v          │          3v          (down or right)  │
+        # │Corner2          v          │          │Corner1                     │
+        # ┼<<<<<<<6<<<<<<<<<┼──────────┼          ┼────────────────────────────┼
         # This diagram illustrates the following algorithm for both possible horizontal moves.
         # The representation also accounts for both possible vertical moves.
+        #(1)
         # Measure origin bonbon's dimension in the action direction (which will be the cut depth)
         # using only East or South directions since the measure is done starting on from NW corner.
         dimension_in_action_direction = 1
@@ -806,6 +758,7 @@ function GI.play!(g::GameEnv, action)
           (column, row) = step_in_measured_action_direction(column, row)
         end
         cut_depth = dimension_in_action_direction
+        # (2)
         # From where we are, measure origin bonbon's dimension in the orthogonal direction
         # (which will be the cut span).
         dimension_in_orthog_direction = 1
@@ -818,17 +771,18 @@ function GI.play!(g::GameEnv, action)
         # Define the base position, which is 1 cell away in action direction from either NW corner
         # or SE corner of origin bonbon.
         (column, row) = (base_column, base_row) = step_in_action_direction((NW_touches_destination ? (NW_column, NW_row) : (SE_column, SE_row))...)
-        # Store a 1st corner of destination bonbon, which will be used to set the former fighter bit
+        # Register a 1st corner of destination bonbon, which will be used to set the former fighter bit
         # and set actions hooks on its whole area.
+        # (3)
         # From base position, look for a border in orthogonal reverse direction.
         while !has_closing_border_in_orthog_reverse_direction(board, column, row)
           (column, row) = step_in_orthog_reverse_direction(column, row)
         end
         (dest_corner1_column, dest_corner1_row) = (column, row)
-        #
         # 1st cut
         # Start penetration into destination bonbon from base position
         (column, row) = (base_column, base_row)
+        # (4)
         # Traverse whole destination bonbon in action direction and add a separation between the visited
         # cells and the cells located 1 step away in the orthogonal reverse direction.
         # Also define a 1st pivot cell, where the penetrated area has same dimension than origin bonbon
@@ -857,8 +811,8 @@ function GI.play!(g::GameEnv, action)
         end
         # Store the projection of pivot1 on the furtherst border of destination bonbon for later use
         (pc1_column, pc1_row) = (column, row)
-        #
         # 2nd cut
+        # (5)
         # Cut destination bonbon from 1st pivot position in orthogonal direction for the same dimension
         # as origin bonbon in this direction, adding a separation between the visited cells and the cells
         # located 1 step away in the action direction.
@@ -874,9 +828,23 @@ function GI.play!(g::GameEnv, action)
         # in the orthogonal direction
         (pivot2_column, pivot2_row) = step_in_orthog_reverse_direction(column, row)
         #
+        # Store a 2nd corner of destination bonbon, which will be used to set the former fighter bit
+        # on its whole area.
+        # (6)
+        # From 2nd pivot position, look for a border in orthogonal direction, then move in the
+        # action direction for the distance we already know now all the way to the border.
+        (column, row) = (pivot2_column, pivot2_row)
+        while !has_closing_border_in_orthog_direction(board, column, row)
+          (column, row) = step_in_orthog_direction(column, row)
+        end
+        for _ in cut_depth:length_cut - 1
+          (column, row) = step_in_action_direction(column, row)
+        end
+        (dest_corner2_column, dest_corner2_row) = (column, row)
         # 3rd cut
         # From 2nd pivot position
         (column, row) = (pivot2_column, pivot2_row)
+        # (7)
         # Traverse whole destination bonbon in action direction and add a separation between the visited
         # cells and the cells located 1 step away in the orthogonal direction.
         add_closing_border_in_orthog_direction(board, column, row)
@@ -889,13 +857,8 @@ function GI.play!(g::GameEnv, action)
         end
         # Store the projection of pivot2 on the furtherst border of destination bonbon for later use
         (pc2_column, pc2_row) = (column, row)
-        # Store a 2nd corner of destination bonbon, which will be used to set the former fighter bit
-        # on its whole area. From the last visited cell, look for a border in orthogonal direction.
-        while !has_closing_border_in_orthog_direction(board, column, row)
-          step_in_orthog_direction(column, row)
-        end
-        (dest_corner2_column, dest_corner2_row) = (column, row)
         # 4th cut
+        # (8)
         # Back to 2nd pivot position, cut destination bonbon from there in action reverse direction
         # for the cut depth, and add a separation between the visited cells and the cells located
         # 1 step away in the orthogonal direction.
@@ -905,8 +868,8 @@ function GI.play!(g::GameEnv, action)
           add_opening_border_in_orthog_direction(board, step_in_orthog_direction(column, row)...)
           (column, row) = step_in_action_reverse_direction(column, row)
         end
-        # Store the final cell reached for later use
-        (final_column, final_row) = (column, row)
+        # Store the final cell modified, for later use
+        (final_column, final_row) = step_in_action_direction(column, row)
         #
         # Fuse
         # From base position, remove the separation between origin and destination bonbons
@@ -929,13 +892,11 @@ function GI.play!(g::GameEnv, action)
         # Ensure a tuple represents coordinates of a cell which isn't out of the board limits
         in_boundaries = x -> max(0, min(BOARD_SIDE - 1, x))
         in_board = (column, row) -> (in_boundaries(column), in_boundaries(row))
-        # For the extended origin bonbon and remaining pieces of destination bonbon,
-        # update former fighters bit and update actions_hook to point to the right NW corner.
-        function update_former_fighter_and_actions_hook((diag1_column, diag1_row), (diag2_column, diag2_row), (new_NW_column, new_NW_row))
+        # Update former fighters bit over the extended origin bonbon and remaining pieces of destination bonbon
+        function update_former_fighter((diag1_column, diag1_row), (diag2_column, diag2_row))
           for column in min(diag1_column, diag2_column):max(diag1_column, diag2_column)
             for row in min(diag1_row, diag2_row):max(diag1_row, diag2_row)
               set_former_fighter(board, column, row)
-              actions_hook[row + 1, column + 1] = (new_NW_column, new_NW_row)
             end
           end
         end
@@ -943,40 +904,89 @@ function GI.play!(g::GameEnv, action)
         # - SE of origin bonbon, if NW of origin bonbon touches destination bonbon
         # - NW of origin bonbon, otherwise.
         (diag1_column, diag1_row) = (pivot1_column, pivot1_row)
-        if NW_touches_destination
-          (diag2_column, diag2_row) = (SE_column, SE_row)
-          (new_NW_column, new_NW_row) = (pivot1_column, pivot1_row)
-        else 
-          (diag2_column, diag2_row) = (NW_column, NW_row)
-          (new_NW_column, new_NW_row) = (NW_column, NW_row)
-        end
-        update_former_fighter_and_actions_hook((diag1_column, diag1_row), (diag2_column, diag2_row), (new_NW_column, new_NW_row))
+        (diag2_column, diag2_row) = NW_touches_destination ? (SE_column, SE_row) : (NW_column, NW_row)
+        update_former_fighter((diag1_column, diag1_row), (diag2_column, diag2_row))
         # For remaining pieces of destination bonbon area, up to 3 parts between previously defined cells
         # 1st part, if corner 1 is distinct from the base position, spans from corner1
         # to (1 step away from) the projection of pivot1 along 1st cut
         if (dest_corner1_column, dest_corner1_row) != (base_column, base_row)
           (diag1_column, diag1_row) = (dest_corner1_column, dest_corner1_row)
           (diag2_column, diag2_row) = in_board(step_in_orthog_reverse_direction(pc1_column, pc1_row)...)
-          (new_NW_column, new_NW_row) = (min(diag1_column, diag2_column), min(diag1_row, diag2_row))
-          update_former_fighter_and_actions_hook((diag1_column, diag1_row), (diag2_column, diag2_row), (new_NW_column, new_NW_row))
+          update_former_fighter((diag1_column, diag1_row), (diag2_column, diag2_row))
         end
         # 2nd part, if its projection is distinct from pivot1, spans from (1 step away from) pivot1
         # to the projection of pivot2 along 3rd cut
         if (pivot1_column, pivot1_row) != (pc1_column, pc1_row)
           (diag1_column, diag1_row) = in_board(step_in_action_direction(pivot1_column, pivot1_row)...)
           (diag2_column, diag2_row) = (pc2_column, pc2_row)
-          (new_NW_column, new_NW_row) = (min(diag1_column, diag2_column), min(diag1_row, diag2_row))
-          update_former_fighter_and_actions_hook((diag1_column, diag1_row), (diag2_column, diag2_row), (new_NW_column, new_NW_row))
+          update_former_fighter((diag1_column, diag1_row), (diag2_column, diag2_row))
         end
-        # 3nd part, if corner2 is distinct from pivot2, spans from corner 2 to
-        # the final cell reached during 4th cut
-        if (dest_corner2_column, dest_corner2_row) != (final_column, final_row)
+        # 3nd part, if corner2 is distinct from the projection of pivot2, spans from corner 2 to
+        # the final cell modified during 4th cut
+        if (dest_corner2_column, dest_corner2_row) != (pc2_column, pc2_row)
           (diag1_column, diag1_row) = (final_column, final_row)
           (diag2_column, diag2_row) = (dest_corner2_column, dest_corner2_row)
-          (new_NW_column, new_NW_row) = (min(diag1_column, diag2_column), min(diag1_row, diag2_row))
-          update_former_fighter_and_actions_hook((diag1_column, diag1_row), (diag2_column, diag2_row), (new_NW_column, new_NW_row))
+          update_former_fighter((diag1_column, diag1_row), (diag2_column, diag2_row))
         end
-      end
+      end # Division or fusion is complete
+      #
+      # TIME FOR EXPANSION?
+      #
+      n_expansion = length(g.history) ÷ EXPAND_PERIOD
+      if length(g.history) % EXPAND_PERIOD == 0 && 0 < n_expansion <= MAX_EXPANSIONS
+        # Execute an expansion
+        for column_h_borders in (n_expansion - 1):(BOARD_SIDE - n_expansion)
+          # North border of the board
+          row_h_borders = n_expansion - 1
+          unset_former_fighter(board, column_h_borders, row_h_borders)
+          set_empty(board, column_h_borders, row_h_borders)
+          remove_N_border(board, column_h_borders, row_h_borders)
+          remove_S_border(board, column_h_borders, row_h_borders - 1)
+          remove_W_border(board, column_h_borders, row_h_borders)
+          remove_E_border(board, column_h_borders - 1, row_h_borders)
+          if !(column_h_borders in [n_expansion - 1, BOARD_SIDE - n_expansion])
+            add_S_border(board, column_h_borders, row_h_borders)
+            add_N_border(board, column_h_borders, row_h_borders + 1)
+          end
+          # West border of the board
+          column_v_borders = row_h_borders
+          row_v_borders = column_h_borders
+          unset_former_fighter(board, column_v_borders, row_v_borders)
+          set_empty(board, column_v_borders, row_v_borders)
+          remove_W_border(board, column_v_borders, row_v_borders)
+          remove_E_border(board, column_v_borders - 1, row_v_borders)
+          remove_N_border(board, column_v_borders, row_v_borders)
+          remove_S_border(board, column_v_borders, row_v_borders - 1)
+          if !(row_v_borders in [n_expansion - 1, BOARD_SIDE - n_expansion])
+            add_E_border(board, column_v_borders, row_v_borders)
+            add_W_border(board, column_v_borders + 1, row_v_borders)
+          end
+          # East border of the board
+          column_v_borders = BOARD_SIDE - row_h_borders - 1
+          unset_former_fighter(board, column_v_borders, row_v_borders)
+          set_empty(board, column_v_borders, row_v_borders)
+          remove_E_border(board, column_v_borders, row_v_borders)
+          remove_W_border(board, column_v_borders + 1, row_v_borders)
+          remove_N_border(board, column_v_borders, row_v_borders)
+          remove_S_border(board, column_v_borders, row_v_borders - 1)
+          if !(row_v_borders in [n_expansion - 1, BOARD_SIDE - n_expansion])
+            add_W_border(board, column_v_borders, row_v_borders)
+            add_E_border(board, column_v_borders - 1, row_v_borders)
+          end
+          # South border of the board
+          row_h_borders = BOARD_SIDE - n_expansion
+          unset_former_fighter(board, column_h_borders, row_h_borders)
+          set_empty(board, column_h_borders, row_h_borders)
+          remove_S_border(board, column_h_borders, row_h_borders)
+          remove_N_border(board, column_h_borders, row_h_borders + 1)
+          remove_W_border(board, column_h_borders, row_h_borders)
+          remove_E_border(board, column_h_borders - 1, row_h_borders)
+          if !(column_h_borders in [n_expansion - 1, BOARD_SIDE - n_expansion])
+            add_N_border(board, column_h_borders, row_h_borders)
+            add_S_border(board, column_h_borders, row_h_borders - 1)
+          end
+        end # for column_h_borders
+      end # Expansion is complete
     catch e
       println("Exception in GI.play! while executing action ", action, " on the following board:")
       GI.render(g)
@@ -985,22 +995,170 @@ function GI.play!(g::GameEnv, action)
     # Finalize game update
     #
     g.board = Board(board)
-    g.actions_hook = ActionsHook(actions_hook)
     g.curplayer = other_player(g.curplayer)
     update_status!(g)
   end
 end
 
+
 ###################################
-# MINMAX HEURISTIC                #
+# HEURISTICS                      #
 ###################################
 #
 # Return the fraction of the non-empty board owned by the White player
+# Used by the Minmax baseline player
 function GI.heuristic_value(g::GameEnv)
   cells_count = NUM_CELLS - count(cell_value_is_empty, g.board)
   white_count = count(cell_value_is_white, g.board)
-  return Float16(white_count / cells_count)
+  return Float64(white_count / cells_count)
 end
+#
+# Max number of actions to let available when applying heuristic to filter bonbons according to their potential impact
+const HEURISTIC_MAX_ACTIONS = 10
+
+
+###################################
+# GAMES MANAGEMENT                #
+###################################
+#
+(initial_amask_white, initial_amask_black, initial_actions_hook, initial_impact) = compute_actions_masks_actions_hooks_impact(INITIAL_BOARD)
+
+# Create a game environment with initial conditions, defined in the list of bonbons INITIAL_BOARD_SIZE_16_LIST
+function GI.init(::GameSpec)
+  board = INITIAL_BOARD
+  curplayer = WHITE
+  actions_hook = copy(initial_actions_hook)
+  amask_white = copy(initial_amask_white)
+  amask_black = copy(initial_amask_black)
+  amask = amask_white
+  finished = false
+  winner = 0x00
+  history = Int[]
+  impact = copy(initial_impact)
+  g = GameEnv(board, curplayer, finished, winner, amask, amask_white, amask_black, actions_hook, history, impact)
+  return g
+end
+#
+# Constructor version which sets the initial state with hard-coded values which were pre-calculated starting with
+# the list of bonbons INITIAL_BOARD_SIZE_16_LIST
+# function Game()
+#   s = read_state_array(["25.00.04.36 05.00.00.00 05.00.00.00 0d.00.00.00 25.40.08.48 05.40.00.00 05.40.00.00 0d.40.00.00 26.80.08.36 06.80.00.00 06.80.00.00 06.80.00.00 06.80.00.00 06.80.00.00 06.80.00.00 0e.80.00.00",
+#     "21.00.00.00 01.00.00.00 01.00.00.00 09.00.00.00 21.40.00.00 01.40.00.00 01.40.00.00 09.40.00.00 22.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 0a.80.00.00",
+#     "21.00.00.00 01.00.00.00 01.00.00.00 09.00.00.00 21.40.00.00 01.40.00.00 01.40.00.00 09.40.00.00 22.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 02.80.00.00 0a.80.00.00",
+#     "21.00.00.00 01.00.00.00 01.00.00.00 09.00.00.00 31.40.00.00 11.40.00.00 11.40.00.00 19.40.00.00 32.80.00.00 12.80.00.00 12.80.00.00 12.80.00.00 12.80.00.00 12.80.00.00 12.80.00.00 1a.80.00.00",
+#     "21.00.00.00 01.00.00.00 01.00.00.00 09.00.00.00 26.44.24.96 06.44.00.00 06.44.00.00 06.44.00.00 06.44.00.00 06.44.00.00 06.44.00.00 0e.44.00.00 25.c4.08.48 05.c4.00.00 05.c4.00.00 0d.c4.00.00",
+#     "21.00.00.00 01.00.00.00 01.00.00.00 09.00.00.00 22.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 0a.44.00.00 21.c4.00.00 01.c4.00.00 01.c4.00.00 09.c4.00.00",
+#     "21.00.00.00 01.00.00.00 01.00.00.00 09.00.00.00 22.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 0a.44.00.00 21.c4.00.00 01.c4.00.00 01.c4.00.00 09.c4.00.00",
+#     "31.00.00.00 11.00.00.00 11.00.00.00 19.00.00.00 22.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 0a.44.00.00 31.c4.00.00 11.c4.00.00 11.c4.00.00 19.c4.00.00",
+#     "25.08.08.48 05.08.00.00 05.08.00.00 0d.08.00.00 22.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 0a.44.00.00 25.c8.04.36 05.c8.00.00 05.c8.00.00 0d.c8.00.00",
+#     "21.08.00.00 01.08.00.00 01.08.00.00 09.08.00.00 22.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 0a.44.00.00 21.c8.00.00 01.c8.00.00 01.c8.00.00 09.c8.00.00",
+#     "21.08.00.00 01.08.00.00 01.08.00.00 09.08.00.00 22.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 02.44.00.00 0a.44.00.00 21.c8.00.00 01.c8.00.00 01.c8.00.00 09.c8.00.00",
+#     "31.08.00.00 11.08.00.00 11.08.00.00 19.08.00.00 32.44.00.00 12.44.00.00 12.44.00.00 12.44.00.00 12.44.00.00 12.44.00.00 12.44.00.00 1a.44.00.00 21.c8.00.00 01.c8.00.00 01.c8.00.00 09.c8.00.00",
+#     "26.0c.08.36 06.0c.00.00 06.0c.00.00 06.0c.00.00 06.0c.00.00 06.0c.00.00 06.0c.00.00 0e.0c.00.00 25.8c.08.48 05.8c.00.00 05.8c.00.00 0d.8c.00.00 21.c8.00.00 01.c8.00.00 01.c8.00.00 09.c8.00.00",
+#     "22.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 0a.0c.00.00 21.8c.00.00 01.8c.00.00 01.8c.00.00 09.8c.00.00 21.c8.00.00 01.c8.00.00 01.c8.00.00 09.c8.00.00",
+#     "22.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 02.0c.00.00 0a.0c.00.00 21.8c.00.00 01.8c.00.00 01.8c.00.00 09.8c.00.00 21.c8.00.00 01.c8.00.00 01.c8.00.00 09.c8.00.00",
+#     "32.0c.00.00 12.0c.00.00 12.0c.00.00 12.0c.00.00 12.0c.00.00 12.0c.00.00 12.0c.00.00 1a.0c.00.00 31.8c.00.00 11.8c.00.00 11.8c.00.00 19.8c.00.00 31.c8.00.00 11.c8.00.00 11.c8.00.00 19.c8.00.00",
+#     "Pink"])
+#   board = s.board
+#   curplayer = s.curplayer
+#   actions_hook = s.actions_hook
+#   amask_white = string_to_booleans("62000000000000006e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000670000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006b0000006800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+#   amask_black = string_to_booleans("00000000000000000000000064000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+#   amask = amask_white
+#   finished = false
+#   winner = 0x00
+#   history = Int[]
+#   impact = s.impact
+#   g = Game(board, curplayer, finished, winner, amask, amask_white, amask_black, actions_hook, history, impact)
+#   return g
+# end
+#
+# Set a given state. Consistency is ensured by updating the status.
+function GI.set_state!(g::GameEnv, s)
+  g.board = s.board
+  g.curplayer = s.curplayer
+  g.actions_hook = s.actions_hook
+  g.amask_white = []
+  g.amask_black = []
+  g.amask = []
+  g.finished = false
+  g.winner = 0x00
+  g.history = []
+  g.impact = s.impact
+  update_status!(g)
+  return g
+end
+#
+# Customization of the standard GI.actions_mask function: we added a use_heuristic argument in order to speed up
+# baseline players by reducing the return set of available actions using the Impact Heuristic.
+# This heuristic allows only actions from the most impactful bonbons, impact being calculated using the frontline
+# and centrality properties of a bonbon:
+# - frontline measures the number of opposing neighboring cells,
+# - centrality is higher as the bonbon center is closer to the center of the board.
+function GI.actions_mask(g::GameEnv, use_heuristic::Bool=false)
+  amask = g.amask
+  if use_heuristic
+    bonbons = []
+    for column in 0:BOARD_SIDE - 1
+      for row in 0:BOARD_SIDE - 1
+        tuple_impact = g.impact[row + 1, column + 1]
+        if tuple_impact != (0, 0)
+          # The bonbon at (column, row) should be considered
+          # Determine bonbon impact: frontline * centrality / 2
+          impact = round(tuple_impact[1] * tuple_impact[2] / 10)
+          # Count bonbon actions
+          first_action = (column_row_to_index((column, row)) - 1) * NUM_ACTIONS_PER_CELL + 1
+          num_actions = count(==(true), amask[first_action:first_action + NUM_ACTIONS_PER_CELL - 1])
+          # Record bonbon in the list
+          push!(bonbons, ((column, row), impact, num_actions))
+        end
+      end
+    end
+    sort!(bonbons, by=(x -> x[2]), rev=true)
+    last_index = num_actions = 0
+    while num_actions < HEURISTIC_MAX_ACTIONS && last_index < length(bonbons)
+      last_index += 1
+      num_actions += bonbons[last_index][3]
+    end
+    for bonbon in bonbons[last_index + 1:end]
+      first_action = (column_row_to_index(bonbon[1]) - 1) * NUM_ACTIONS_PER_CELL + 1
+      for a in 0:NUM_ACTIONS_PER_CELL - 1
+        amask[first_action + a] = false
+      end
+    end
+  end
+  return amask
+end
+#
+# GI.actions_mask(g::GameEnv) = g.amask
+GI.two_players(::GameSpec) = true
+GI.current_state(g::GameEnv) = (board=g.board, impact=g.impact, actions_hook=g.actions_hook, curplayer=g.curplayer)
+GI.white_playing(g::GameEnv) = g.curplayer == WHITE
+
+#
+function GI.clone(g::GameEnv)
+  history = isnothing(g.history) ? nothing : copy(g.history)
+  GameEnv(copy(g.board), g.curplayer, g.finished, g.winner, copy(g.amask), copy(g.amask_white), copy(g.amask_black), copy(g.actions_hook), history, copy(g.impact))
+end
+#
+###
+# Reward shaping
+###
+#
+function GI.game_terminated(g::GameEnv)
+  return g.finished
+end
+#
+function GI.white_reward(g::GameEnv)
+  if g.finished
+    g.winner == WHITE && (return  1.)
+    g.winner == BLACK && (return -1.)
+    return 0.
+  else
+    return 0.
+  end
+end
+
 
 ###################################
 # MACHINE LEARNING API            #
@@ -1026,7 +1184,7 @@ end
 # Channels: empty, white, black, North border, West border, former fighter.
 # The board is represented from the perspective of white (ie as if white were to play next)
 function GI.vectorize_state(::GameSpec, state)
-  board = GI.white_playing(Game, state) ? state.board : flip_colors(state.board)
+  board = state.curplayer == WHITE ? state.board : flip_colors(state.board)
   return Float32[
     property_cell(board, column, row)
     for column in 0:BOARD_SIDE - 1,
@@ -1041,136 +1199,195 @@ end
 # SYMMETRIES                      #
 ###################################
 #
-# Define non-identical symmetries and return an array of couples (cell_sym, action_sym)
-function generate_dihedral_symmetries()
-  #
-  # 90° rotation (anti clockwise)
-  rotate_cell(nothing) = nothing
-  rotate_cell((column, row)) = (row, BOARD_SIDE - 1 - column)
-  rotate_cell(value) = booleans_to_integer([cell_value_is_white(value), cell_value_is_black(value),
-    cell_value_has_E_border(value), cell_value_has_S_border(value), cell_value_has_W_border(value), cell_value_has_N_border(value),
-    cell_value_is_former_fighter(value)]
-  )
-  function rotate_action(action::Int)
-    # New coordinates of source cell
-    (column, row) = rotate_cell(index_to_column_row(action ÷ NUM_ACTIONS_PER_CELL) + 1)
-    # Type (unchanged)
-    type = (action & ACTION_TYPE_MASK) / ACTION_TYPE_MASK
-    # New direction of action
-    direction = (action % ACTION_DIRECTION_DIV + 3) % ACTION_DIRECTION_DIV
-    return action_value(column, row, type, direction)
-  end
-  # -90° rotation (clockwise)
-  inv_rotate_cell(nothing) = nothing
-  inv_rotate_cell((column, row)) = (row, BOARD_SIDE - column)
-  inv_rotate_cell(value) = booleans_to_integer([cell_value_is_white(value), cell_value_is_black(value),
-    cell_value_has_W_border(value), cell_value_has_N_border(value), cell_value_has_E_border(value), cell_value_has_S_border(value),
-    cell_value_is_former_fighter(value)]
-  )
-  function inv_rotate_action(action::Int)
-    # New coordinates of source cell
-    (column, row) = inv_rotate_cell(index_to_column_row(action ÷ NUM_ACTIONS_PER_CELL) + 1)
-    # Type (unchanged)
-    type = (action & ACTION_TYPE_MASK) / ACTION_TYPE_MASK
-    # New direction of action
-    direction = (action % ACTION_DIRECTION_DIV + 1) % ACTION_DIRECTION_DIV
-    return action_value(column, row, type, direction)
-  end
-  #
-  # 180° rotations
-  rotate_cell_2 = rotate_cell ∘ rotate_cell
-  rotate_action_2 = rotate_action ∘ rotate_action
-  #
-  # 270° rotations
-  rotate_cell_3 = rotate_cell_2 ∘ rotate_cell
-  rotate_action_3 = rotate_action_2 ∘ rotate_action
-  #
-  # flip along horizontal axis
-  h_flip_cell(nothing) = nothing
-  h_flip_cell((column, row)) = (column, BOARD_SIDE - row)
-  h_flip_cell(value) = booleans_to_integer([cell_value_is_white(value), !cell_value_is_white(value),
-    cell_value_has_S_border(value), cell_value_has_W_border(value), cell_value_has_N_border(value), cell_value_has_E_border(value),
-    cell_value_is_former_fighter(value)]
-  )
-  function h_flip_action(value::Int)
-    # New coordinates of former NW corner (which isn't NW corner any longer)
-    (column, row) = h_flip_cell((column, row))
-    # Type (unchanged)
-    type = value & ACTION_TYPE_MASK = ACTION_TYPE_MASK ? 1 : 0
-    # New direction
-    direction = (value % ACTION_DIRECTION_DIV + 2) % ACTION_DIRECTION_DIV
-    return action_value(column, row, type, direction)
-  end
-  # Return all tuples of (cell_sym, action_sym, inv_action_sym)
-  return [
-    (rotate_cell, rotate_action, rotate_action_3), (rotate_cell_2, rotate_action_2, rotate_action_2), (rotate_cell_3, rotate_action_3, rotate_action),
-    (h_flip_cell, h_flip_action, h_flip_action), (h_flip_cell ∘ rotate_cell, h_flip_action ∘ rotate_action, rotate_action_3 ∘ h_flip_action),
-    (h_flip_cell ∘ rotate_cell_2, h_flip_action ∘ rotate_action_2, rotate_action_2 ∘ h_flip_action), (h_flip_cell ∘ rotate_cell_3, h_flip_action ∘ rotate_action_3, rotate_action ∘ h_flip_action)
-  ]
+# 90° rotation (anti clockwise)
+rotate_cell((column, row)) = (row, BOARD_SIDE - 1 - column)
+rotate_cell(value::Cell) = Cell(booleans_to_integer([cell_value_is_white(value), cell_value_is_black(value),
+  cell_value_has_E_border(value), cell_value_has_S_border(value), cell_value_has_W_border(value), cell_value_has_N_border(value),
+  cell_value_is_former_fighter(value)]))
+function rotate_action(action::Int)
+  # New coordinates of source cell
+  (column, row) = rotate_cell(index_to_column_row(action ÷ NUM_ACTIONS_PER_CELL + 1))
+  # Type (unchanged)
+  type = (action & ACTION_TYPE_MASK) ÷ ACTION_TYPE_MASK
+  # New direction of action
+  direction = (action % ACTION_DIRECTION_DIV + 3) % ACTION_DIRECTION_DIV
+  return action_value(column, row, type, direction)
+end
+# -90° rotation (clockwise)
+inv_rotate_cell((column, row)) = (row, BOARD_SIDE - column)
+inv_rotate_cell(value::Cell) = Cell(booleans_to_integer([cell_value_is_white(value), cell_value_is_black(value),
+  cell_value_has_W_border(value), cell_value_has_N_border(value), cell_value_has_E_border(value), cell_value_has_S_border(value),
+  cell_value_is_former_fighter(value)]))
+function inv_rotate_action(action::Int)
+  # New coordinates of source cell
+  (column, row) = inv_rotate_cell(index_to_column_row(action ÷ NUM_ACTIONS_PER_CELL + 1))
+  # Type (unchanged)
+  type = (action & ACTION_TYPE_MASK) ÷ ACTION_TYPE_MASK
+  # New direction of action
+  direction = (action % ACTION_DIRECTION_DIV + 1) % ACTION_DIRECTION_DIV
+  return action_value(column, row, type, direction)
 end
 #
-# Given a state state1 and a symmetry (sym_cell, sym_action(not used here), inv_sym_action) for cells
-# and actions, return the pair (state2, σ) where state2 is the image of state1 by the symmetry and
-# σ is the associated actions permutations, as an integer vector of size num_actions(Game).
-# NB σ = inverse(sym_action) since if actions_mask1 corresponds to state1 and actions_mask2
-# corresponds to state2, the following holds:
-#   actions_mask2[action_index] == actions_mask1[σ(action_index)] and since
-#                               == actions_mask1[j] with action_index == sym_action(j)
-#   then j == σ(action_index) == inv_sym_action(action_index)
-function apply_symmetry(state, sym_cell, inv_sym_action)
-  # Apply the symmetry to the board and the actions hook table
-  board = Array(EMPTY_BOARD)
-  actions_hook = Array(EMPTY_ACTIONS_HOOK)
+# 180° rotations
+rotate_cell_2 = rotate_cell ∘ rotate_cell
+rotate_action_2 = rotate_action ∘ rotate_action
+#
+# 270° rotations
+rotate_cell_3 = rotate_cell_2 ∘ rotate_cell
+rotate_action_3 = rotate_action_2 ∘ rotate_action
+#
+# flip along horizontal axis
+h_flip_cell((column, row)) = (column, BOARD_SIDE - row - 1)
+h_flip_cell(value::Cell) = Cell(booleans_to_integer([cell_value_is_white(value), cell_value_is_black(value),
+  cell_value_has_S_border(value), cell_value_has_E_border(value), cell_value_has_N_border(value), cell_value_has_W_border(value),
+  cell_value_is_former_fighter(value)]))
+function h_flip_action(action::Int)
+  # New coordinates of former NW corner (which isn't NW corner any longer)
+  (column, row) = h_flip_cell(index_to_column_row(action ÷ NUM_ACTIONS_PER_CELL + 1))
+  # Type (unchanged)
+  type = (action & ACTION_TYPE_MASK) ÷ ACTION_TYPE_MASK
+  # New direction
+  dir = (action % ACTION_DIRECTION_DIV)
+  direction = dir % 2 == 0 ? (dir + 2) % ACTION_DIRECTION_DIV : dir
+  return action_value(column, row, type, direction)
+end
+#
+# Define non-identical symmetries as an array of tuples (cell_sym, inv_cell_sym, action_sym, inv_cell_sym)
+const SYMMETRIES = [
+  (rotate_cell, rotate_cell_3, rotate_action, rotate_action_3),
+  (rotate_cell_2, rotate_cell_2, rotate_action_2, rotate_action_2),
+  (rotate_cell_3, rotate_cell, rotate_action_3, rotate_action),
+  (h_flip_cell, h_flip_cell, h_flip_action, h_flip_action),
+  (h_flip_cell ∘ rotate_cell, rotate_cell_3 ∘ h_flip_cell, h_flip_action ∘ rotate_action, rotate_action_3 ∘ h_flip_action),
+  (h_flip_cell ∘ rotate_cell_2, rotate_cell_2 ∘ h_flip_cell, h_flip_action ∘ rotate_action_2, rotate_action_2 ∘ h_flip_action),
+  (h_flip_cell ∘ rotate_cell_3, rotate_cell ∘ h_flip_cell, h_flip_action ∘ rotate_action_3, rotate_action ∘ h_flip_action)
+]
+#=
+Given a state state1 and a symmetry (sym_cell, inv_sym_cell, sym_action(not used here), inv_sym_action)
+for cells and actions, return the pair (state2, σ) where state2 is the image of state1 by the symmetry
+and σ is the associated actions permutations -an integer vector of size num_actions(GameSpec), such as
+if actions_mask1 corresponds to state1 and actions_mask2 corresponds to state2:
+actions_mask2[action_index] == actions_mask1[σ(action_index)]
+=#
+function apply_symmetry(state, sym_cell, inv_sym_cell, sym_action, inv_sym_action)
+  board = state.board
+  impact = state.impact
+  actions_hook = state.actions_hook
+  # Assess if applying the symmetry to a valid division along an evenly long bonbon dimension
+  # could transform the action into an invalid division
+  sym_of_unique_legal_div_could_be_N = inv_sym_action(action_value(0, 0, 0, DIRECTION_NORTH)) % ACTION_TYPE_MASK in [DIRECTION_EAST, DIRECTION_SOUTH]
+  sym_of_unique_legal_div_could_be_W = inv_sym_action(action_value(0, 0, 0, DIRECTION_WEST)) % ACTION_TYPE_MASK in [DIRECTION_EAST, DIRECTION_SOUTH]
+  # Apply the symmetry to the board, the impact table and the actions hook table
+  res_board = Array(ZERO_BOARD)
+  res_impact = Array(ZERO_TUPLE)
+  res_actions_hook = Array(EMPTY_TUPLE)
   for column in 0:BOARD_SIDE - 1
     for row in 0:BOARD_SIDE - 1
-      # sym_cell moves cell (column, row) in the board and its actions hook in the actions hook
-      # table to (newColumn, newRow)...
-      (newColumn, newRow) = sym_cell(column, row)
-      # ...also changing their values
-      board[newRow + 1, newColumn + 1] = sym_cell(state.board[row + 1, column + 1])
-      actions_hook[newRow + 1, newColumn + 1] = sym_cell(state.actions_hook[row + 1, column + 1])
+      # sym_cell moves cell (column, row) to (newColumn, newRow) in the board, the impact and the actions hook tables...
+      (newColumn, newRow) = sym_cell((column, row))
+      res_impact[newRow + 1, newColumn + 1] = impact[row + 1, column + 1]
+      # ...also changing the cells values for the board and the actions hook table
+      res_board[newRow + 1, newColumn + 1] = sym_cell(board[row + 1, column + 1])
+      res_actions_hook[newRow + 1, newColumn + 1] = sym_cell(actions_hook[row + 1, column + 1])
       # (The new actions hook position won't be on a NW corner any longer)
     end
-  end # Symmetry is applied to the board and actions hook table
-  # Actions permutations is the inverse of sym_action
-  actions_permutations = map(inv_sym_action, collect(0:NUM_ACTIONS_PER_CELL * NUM_CELLS - 1))
-  # Update actions_hook so that all cells point to actual NW corners: search the new board for
-  # new NW corners and set actions hook to these cells for all cells in their bonbon
+  end # Symmetry is applied on a per cell basis
+  #=
+  Permutation of actions defined on a per cell basis:
+  mask2[action_index] == mask1[σ(action_index)]
+  mask2[action + 1] == mask1[σ(action + 1)]
+  mask2[action + 1] == mask1[j + 1] with action == sym_action(j) i.e. j == inv_sym_action(action)
+  mask2[action + 1] == mask1[inv_sym_action(action) + 1]
+  Hence σ(action + 1) == inv_sym_action(action) + 1
+  Hence σ(action_index) == inv_sym_action(action_index - 1) + 1
+  =#
+  σ = map(i -> inv_sym_action(i - 1) + 1, collect(1:NUM_ACTIONS_PER_CELL * NUM_CELLS))
+  #=
+  For the symmetry to work on a per bonbon basis while keeping the number of possible actions minimum:
+  1. impact should be attached to post-symmetry NW corners
+  2. σ should link the actions based on post-symmetry NW corners to the actions based on pre-symmetry
+     NW corners of the same bonbons,
+  3. actions hooks should point to post-symmetry NW corners for all cells in a bonbon,
+  4. division actions pointing North or West along evenly long borders should be re-oriented.
+  =#
   for column in 0:BOARD_SIDE - 1
     for row in 0:BOARD_SIDE - 1
-      if has_N_border(board, column, row) && has_W_border(board, column, row)
-        # Cell (column, row) is a new NW corner.
-        # Store former NW corner's coordinates to be replaced in actions_hook by the new ones.
-        (actions_hook_column, actions_hook_row) = actions_hook[row + 1, column + 1]
+      if has_N_border(res_board, column, row) && has_W_border(res_board, column, row)
+        # Cell (column, row) is a post-sym NW corner.
+        # 1. Get the impact from the transformed pre-sym NW corner
+        # Locate the pre-sym NW corner
+        (sym_of_pre_sym_NW_column, sym_of_pre_sym_NW_row) = res_actions_hook[row + 1, column + 1]
+        # Swap fronline length values
+        (res_impact[row + 1, column + 1], res_impact[sym_of_pre_sym_NW_row + 1, sym_of_pre_sym_NW_column + 1]) = (res_impact[sym_of_pre_sym_NW_row + 1, sym_of_pre_sym_NW_column + 1], res_impact[row + 1, column + 1])
+        # 2. Adjust σ to point to the cell holding the pre-sym actions
+        # The legal actions are the transformed actions of the pre-sym NW corner of its bonbon.
+        # Locate the pre-sym NW corner of its bonbon: it transforms into the cell currently
+        # pointed to in the transformed actions hook table.
+        (pre_sym_NW_column, pre_sym_NW_row) = inv_sym_cell((sym_of_pre_sym_NW_column, sym_of_pre_sym_NW_row))
+        # Make sure the permutation swaps the post-sym NW corner actions and the pre-sym NW corner ones,
+        # the latter being (pre-sym) the only legal actions for the whole bonbon.
+        # Adapt the permutation for the post-sym NW corner so that it points to pre-sym NW corner actions
+        base_post_sym_index = NUM_ACTIONS_PER_CELL * (column_row_to_index((column, row)) - 1)
+        delta_permutation = NUM_ACTIONS_PER_CELL * (column_row_to_index((sym_of_pre_sym_NW_column, sym_of_pre_sym_NW_row)) - 1) - base_post_sym_index
+        for action_index in (base_post_sym_index + 1):(base_post_sym_index + NUM_ACTIONS_PER_CELL)
+          # First, translate to the transformed pre-sym NW corner actions since this doesn't affect their order.
+          # Then apply inv_sym_action to link with the actions of the pre-sym NW corner.
+          σ[action_index] = inv_sym_action(action_index + delta_permutation - 1) + 1
+        end
+        # Adapt the permutation for the transformed pre-sym NW corner so that it points to
+        # post-sym NW corner's pre-sym actions
+        base_post_sym_index = NUM_ACTIONS_PER_CELL * (column_row_to_index((sym_of_pre_sym_NW_column, sym_of_pre_sym_NW_row)) - 1)
+        delta_permutation = -delta_permutation
+        for action_index in (base_post_sym_index + 1):(base_post_sym_index + NUM_ACTIONS_PER_CELL)
+          # First, translate to the post-sym NW corner actions since this doesn't affect their order.
+          # Then apply inv_sym_action to link with the actions of the naturally permuted post-sym NW corner.
+          σ[action_index] = inv_sym_action(action_index + delta_permutation - 1) + 1
+        end
+        # 3. Adjust actions_hook
+        # Update the actions hook for the whole bonbon in order to point to the new NW corner (column, row).
         # Determine the dimensions of this bonbon for which the new actions hook must be set
         width = height = 1
-        while actions_hook[row + 1, column + 1 + width] == (actions_hook_column, actions_hook_row)
+        while column + width < BOARD_SIDE && res_actions_hook[row + 1, column + 1 + width] == (sym_of_pre_sym_NW_column, sym_of_pre_sym_NW_row)
           width += 1
         end
-        while actions_hook[row + 1 + height, column + 1] == (actions_hook_column, actions_hook_row)
+        while row + height < BOARD_SIDE && res_actions_hook[row + 1 + height, column + 1] == (sym_of_pre_sym_NW_column, sym_of_pre_sym_NW_row)
           height += 1
         end
-        # Set the actions hook for this bonbon to this NW corner instead of where sym_cell moved
-        # the former NW corner
+        # Update the actions hook for the whole bonbon area to point to the new NW corner
         for c in column:column + width - 1
           for r in row:row + height - 1
-            actions_hook[r + 1, c + 1] = (column, row)
+            res_actions_hook[r + 1, c + 1] = (column, row)
           end
         end # Actions hook table is updated
+        # 4. Adjust σ to re-orient division actions
+        if height % 2 == 0 && sym_of_unique_legal_div_could_be_N
+          #= Height has even length => avoid divisions towards N created by natural application of  symmetry
+          by swapping them in σ with divisions towards S, based on the assumption that in such configuration,
+          if an action towards E or S transforms into an action towards N, then the actions in the other
+          potentially unique direction (S or E, respectively) won't tranform in actions towards either N or S.
+          =#
+          σ[action_value(column, row, 0, DIRECTION_NORTH) + 1], σ[action_value(column, row, 0, DIRECTION_SOUTH) + 1] = σ[action_value(column, row, 0, DIRECTION_SOUTH) + 1], σ[action_value(column, row, 0, DIRECTION_NORTH) + 1]
+        end
+        if width % 2 == 0 && sym_of_unique_legal_div_could_be_W
+          #= Width has even length => avoid divisions towards W created by natural application of  symmetry
+          by swapping them in σ with divisions towards E, based on the assumption that in such configuration,
+          if an action towards E or S transforms into an action towards W, then the actions in the other
+          potentially unique direction (S or E, respectively) won't tranform in actions towards either W or E.
+          =#
+          σ[action_value(column, row, 0, DIRECTION_WEST) + 1], σ[action_value(column, row, 0, DIRECTION_EAST) + 1] = σ[action_value(column, row, 0, DIRECTION_EAST) + 1], σ[action_value(column, row, 0, DIRECTION_WEST) + 1]
+        end
       end # New NW corner is processed
     end
   end # New board has been scanned
   # Return (s, σ)
   return (
-    (board=Board(board), actions_hook=ActionsHook(actions_hook), curplayer=state.curplayer),
-    Vector{Int}(actions_permutations)
+    (board=Board(res_board), impact=BoardTuple(res_impact), actions_hook=BoardTuple(res_actions_hook), curplayer=state.curplayer),
+    Vector{Int}(σ)
   )
 end
 #
-const SYMMETRIES = generate_dihedral_symmetries()
-#
 function GI.symmetries(::GameSpec, s)
-  return [apply_symmetry(s, sym_cell, inv_sym_action) for (sym_cell, sym_action, inv_sym_action) in SYMMETRIES]
+  return [apply_symmetry(s, sym_cell, inv_sym_cell, sym_action, inv_sym_action) for (sym_cell, inv_sym_cell, sym_action, inv_sym_action) in SYMMETRIES]
 end
 
 ###################################
@@ -1179,7 +1396,7 @@ end
 #
 GI.action_string(::GameSpec, a) = string(string(a ÷ NUM_ACTIONS_PER_CELL, base=16), " $(a & ACTION_TYPE_MASK == ACTION_TYPE_MASK ? '*' : '/') $(['N', 'E', 'S', 'W'][a % ACTION_DIRECTION_DIV + 1])")
 #
-function GI.parse_action(g::GameSpec, str)
+function GI.parse_action(::GameSpec, str)
   try
     if length(str) == 4
       action_array = [str[1:2], str[3:3], str[4:4]]
@@ -1193,9 +1410,14 @@ function GI.parse_action(g::GameSpec, str)
     action_direction = findfirst(contains(action_array[3]), ["nN", "eE", "sS", "wW"]) - 1
     return action_origin * NUM_ACTIONS_PER_CELL + action_type * ACTION_TYPE_MASK + action_direction
   catch
-    println("Error")
+    println("Error while parsing action '", str, "'")
     nothing
   end
+end
+#
+# FOR DEBUG PURPOSE ONLY
+function play_move!(g::GameEnv, s::String)
+  GI.play!(g, GI.parse_action(GameSpec, s))
 end
 #
 # The board is represented by a "print matrix" in which each cell represents either a piece of a board
@@ -1229,7 +1451,7 @@ column_row_to_print_matrix_E_border_corners(column, row) = (north_west=(row=3row
 # Gives a property of the board cell in (column, row) to the print matrix cells in an area.
 # The property modifier is the argument function set_property.
 # The corners of the area are provided by the argument function area_corners applied on column, row.
-function print_cell_property_to_print_matrix(column, row, print_matrix, area_corners, set_property)
+function print_cell_property_to_print_matrix!(column, row, print_matrix, area_corners, set_property)
   (northwest, southeast) = area_corners(column, row)
   for r in northwest.row:southeast.row
     for c in northwest.column:southeast.column
@@ -1253,7 +1475,7 @@ function build_print_matrix(g::GameEnv)
           (cell_value_is_black, column_row_to_print_matrix_pulp_corners, set_black),
           (cell_value_is_former_fighter, column_row_to_print_matrix_pulp_corners, set_former_fighter)
       ]
-        test_cell_value(cell_value) && print_cell_property_to_print_matrix(column, row, print_matrix, area_corners, set_property)
+        test_cell_value(cell_value) && print_cell_property_to_print_matrix!(column, row, print_matrix, area_corners, set_property)
       end
     end
   end
@@ -1296,13 +1518,15 @@ function print_print_matrix(print_matrix::PrintMatrix)
   end
 end
 #
-# Print the board
-function GI.render(g::GameEnv; with_position_names=true, botmargin=true)
+# Print the board to standard output
+# The botmargin argument is used to display bonbons impact instead of coordinates and legal actions
+function GI.render(g::GameEnv; with_position_names=true, botmargin=false)
   pname = player_name(g.curplayer)
   pcol = player_color(g.curplayer)
-  print(pcol, pname, " plays:", crayon"reset", "\n\n")
+  print("Move ", length(g.history) + 1, ". ", pcol, pname, " plays:", crayon"reset", "\n\n")
   board = g.board
   amask = g.amask
+  impact = g.impact
   print_matrix = build_print_matrix(g)
   print(" ")
   # Print column labels
@@ -1322,6 +1546,10 @@ function GI.render(g::GameEnv; with_position_names=true, botmargin=true)
     print(" ")
     for c in 1:3BOARD_SIDE + 1
       column = (c - 1) ÷ 3
+      if botmargin && column < BOARD_SIDE && row < BOARD_SIDE
+        frontline = impact[row + 1, column + 1][1]
+        centrality = impact[row + 1, column + 1][2]
+      end
       print_value = print_matrix[r, c]
       # Determine which char to print if not " " (background) :
       # If border cell:  graphic char with horizontal and/or vertical dash
@@ -1339,26 +1567,35 @@ function GI.render(g::GameEnv; with_position_names=true, botmargin=true)
         end
       else # Cell is a pulp cell
         if has_N_border(board, column, row) && has_W_border(board, column, row)
-          # Corresponding board cell is a NW corner => print coordinates
+          # Corresponding board cell is a NW corner => print coordinates and legal actions code,
+          # unless botmargin=true then print bonbon impact
           if ((r - 1) % 3) == 1
-            # North pulp cells of NW board cell => print coordinates
+            # North pulp cells of NW board cell => print coordinates or frontline
             if ((c - 1) % 3) == 1
-              # NW pulp cell of NW board cell => print column
-              print_mark = " " * string(column, base=16)
+              # NW pulp cell of NW board cell => print column or frontline 1st digit
+              print_mark = " " * (botmargin ? string(frontline ÷ 10) : string(column, base=16))
             else
-              # NE pulp cell of NW board cell => print row
-              print_mark = string(row, base=16) * " "
+              # NE pulp cell of NW board cell => print row or frontline 2nd digit
+              print_mark = (botmargin ? string(frontline % 10) : string(row, base=16)) * " "
             end
           elseif ((r - 1) % 3) == 2
-            # South pulp cells of NW board cell => print legal actions code
+            # South pulp cells of NW board cell => print legal actions code or centrality
             if ((c - 1) % 3) == 1
-              # SW pulp cell of NW board cell => print 1st char of legal actions code (fusions)
-              first_action = (column_row_to_index((column, row)) - 1) * NUM_ACTIONS_PER_CELL + 1
-              print_mark = " " * string(booleans_to_integer(amask[first_action + 4:first_action + 7]), base=16)
+              # SW pulp cell of NW board cell => print 1st char of legal actions code (fusions) or centrality 1st digit
+              if botmargin
+                print_mark = " " * string(centrality ÷ 10)
+              else
+                  first_action = (column_row_to_index((column, row)) - 1) * NUM_ACTIONS_PER_CELL + 1
+                  print_mark = " " * string(booleans_to_integer(amask[first_action + 4:first_action + 7]), base=16)
+              end
             else
-              # SE pulp cell of NW board cell => print 2nd char of legal actions code (divisions)
-              first_action = (column_row_to_index((column, row)) - 1) * NUM_ACTIONS_PER_CELL + 1
-              print_mark = string(booleans_to_integer(amask[first_action:first_action + 3]), base=16) * " "
+              # SE pulp cell of NW board cell => print 2nd char of legal actions code (divisions) or centrality 2nd digit
+              if botmargin
+                print_mark = string(centrality % 10) * " "
+              else
+                first_action = (column_row_to_index((column, row)) - 1) * NUM_ACTIONS_PER_CELL + 1
+                print_mark = string(booleans_to_integer(amask[first_action:first_action + 3]), base=16) * " "
+              end
             end
           end # Pulp cell of NW corner has its print_mark
         else
@@ -1379,65 +1616,75 @@ function GI.render(g::GameEnv; with_position_names=true, botmargin=true)
     print("    ", string(c, base=16))
   end
   print("\n")
-  botmargin && print("\n")
-end
-
-function read_row!(row::Int, input::String, board::Array, actions_hook::Array)
-  cells = split(input[1:length(input)], " ")
-  for column in 1:BOARD_SIDE
-    values = split(cells[column], ".")
-    board[row, column] = parse(Int, values[1], base=16)
-    c = parse(Int, values[2][1], base=16)
-    r = parse(Int, values[2][2], base=16)
-    actions_hook[row, column] = (c, r)
+  if botmargin
+    print("\n")
   end
 end
-
-function read_state(rows::Array, player::String)
-  board = Array(EMPTY_BOARD)
-  actions_hook = Array(EMPTY_ACTIONS_HOOK)
-  try
-    for row in 1:BOARD_SIDE
-      input = rows[row]
-      read_row!(row, input, board, actions_hook)
-    end
-    curplayer = player == player_name(BLACK) ? BLACK : WHITE
-    return (board=Board(board), actions_hook=ActionsHook(actions_hook), curplayer=curplayer)
-  catch e
-    return nothing
+#
+function read_row!(row_index::Int, input::String, board::Array, impact::Array, actions_hook::Array)
+  s = input
+  l = length(s)
+  if s[l] == " "
+    s = s[1:l - 1]
+  end
+  cells = split(s, " ")
+  for column_index in 1:BOARD_SIDE
+    values = split(cells[column_index], ".")
+    board[row_index, column_index] = parse(Int, values[1], base=16)
+    impact[row_index, column_index] = (parse(Int, values[3], base=10), parse(Int, values[4], base=10))
+    column = parse(Int, values[2][1], base=16)
+    row = parse(Int, values[2][2], base=16)
+    actions_hook[row_index, column_index] = (column, row)
   end
 end
-
-function dump_state(g::GameEnv)
-  for row in 1:BOARD_SIDE
-    for column in 1:BOARD_SIDE
-      cell_value = g.board[row, column]
-      actions_hook = g.actions_hook[row, column]
+#
+function read_game(::GameSpec)
+  g = GI.init(GameSpec)
+  GI.set_state!(g, read_state(GameSpec))
+  return g
+end
+#
+function dump_game(g::GameEnv)
+  for row_index in 1:BOARD_SIDE
+    for column_index in 1:BOARD_SIDE
+      cell_value = g.board[row_index, column_index]
+      impact = g.impact[row_index, column_index]
+      actions_hook = g.actions_hook[row_index, column_index]
       print(string(cell_value, base=16, pad=2), ".",
-        string(actions_hook[1], base=16), string(actions_hook[2], base=16), " ")
+        string(actions_hook[1], base=16), string(actions_hook[2], base=16), ".",
+        string(impact[1], base=10, pad=2), ".", string(impact[2], base=10, pad=2),  " ")
     end
     print("\n")
   end
   print(player_name(g.curplayer))
 end
-
-function GI.read_state(::GameSpec)
-  board = Array(EMPTY_BOARD)
-  actions_hook = Array(EMPTY_ACTIONS_HOOK)
+#
+function read_state_array(rows::Array)
+  board = Array(ZERO_BOARD)
+  impact = Array(ZERO_TUPLE)
+  actions_hook = Array(EMPTY_TUPLE)
   try
-    for row in 1:BOARD_SIDE
-      input = readline()
-      cells = split(input[1:length(input) - 1], " ")
-      for column in 1:BOARD_SIDE
-        values = split(cells[column], ".")
-        board[row, column] = parse(Int, values[1], base=16)
-        c = parse(Int, values[2][1], base=16)
-        r = parse(Int, values[2][2], base=16)
-        actions_hook[row, column] = (c, r)
-      end
+    for row_index in 1:BOARD_SIDE
+      input = rows[row_index]
+      read_row!(row_index, input, board, impact, actions_hook)
+    end
+    curplayer = rows[BOARD_SIDE + 1] == player_name(BLACK) ? BLACK : WHITE
+    return (board=Board(board), impact=BoardTuple(impact), actions_hook=BoardTuple(actions_hook), curplayer=curplayer)
+  catch e
+    return nothing
+  end
+end
+#
+function GI.read_state(::GameSpec)
+  board = Array(ZERO_BOARD)
+  impact = Array(ZERO_TUPLE)
+  actions_hook = Array(EMPTY_TUPLE)
+  try
+    for row_index in 1:BOARD_SIDE
+      read_row!(row_index, readline(), board, impact, actions_hook)
     end
     curplayer = readline() == player_name(BLACK) ? BLACK : WHITE
-    return (board=board, actions_hook=actions_hook, curplayer=curplayer)
+    return (board=board, impact=impact, actions_hook=actions_hook, curplayer=curplayer)
   catch e
     return nothing
   end

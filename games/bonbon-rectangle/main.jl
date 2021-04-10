@@ -1,8 +1,9 @@
 module BonbonRectangle
-  export Game, Board
-  include("game.jl")
+export GameEnv, GameSpec, Board
+include("game.jl")
   module Training
     using AlphaZero
+    import ..GameSpec
     include("params.jl")
   end
 end

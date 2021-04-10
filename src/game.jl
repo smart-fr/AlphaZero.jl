@@ -328,12 +328,11 @@ Return the vector of all available actions.
 #   return actions(spec(game))[mask]
 # end
 # Customized so that baseline players can use a heuristic
-function available_actions(env::AbstractGameEnv, use_heuristic::Bool=false)
-    Game = typeof(env)
-    mask = actions_mask(env, use_heuristic)
-    return actions(Game)[mask]
-  end
-  
+function available_actions(game::AbstractGameEnv, use_heuristic::Bool=false)
+  mask = actions_mask(game, use_heuristic)
+  return actions(spec(game))[mask]
+end
+
 """
     apply_random_symmetry!(::AbstractGameEnv)
 
