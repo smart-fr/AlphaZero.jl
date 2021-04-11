@@ -1614,9 +1614,7 @@ function GI.render(g::GameEnv; with_position_names=true, botmargin=false)
     print("    ", string(c, base=16))
   end
   print("\n")
-  if botmargin
-    print("\n")
-  end
+  print("\n")
 end
 #
 function read_row!(row_index::Int, input::String, board::Array, impact::Array, actions_hook::Array)
