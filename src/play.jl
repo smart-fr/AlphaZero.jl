@@ -330,14 +330,29 @@ struct Human <: AbstractPlayer end
 
 struct Quit <: Exception end
 
+# function select_move(::Human, game, turn)
+#   a = nothing
+#   while isnothing(a) || a ∉ GI.available_actions(game)
+#     print("> ")
+#     str = readline()
+#     print("\n")
+#     isempty(str) && throw(Quit())
+#     a = GI.parse_action(GI.spec(game), str)
+#   end
+#   return a
+# end
+
 function select_move(::Human, game, turn)
+  str = ""
   a = nothing
   while isnothing(a) || a ∉ GI.available_actions(game)
-    print("> ")
-    str = readline()
+    while str == ""
+      print("> ")
+      str = readline()
+    end
     print("\n")
     lowercase(str) == "end" && throw(Quit())
-    a = GI.parse_action(game, str)
+    a = GI.parse_action(GI.spec(game), str)
   end
   return a
 end

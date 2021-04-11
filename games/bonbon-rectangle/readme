@@ -2,9 +2,9 @@ Visit https://bonbonrectangle.com to play this game! :)
 
 History
 
-10/04/2021
-Adaptation to AlphaZero.jl v0.4
-Passed all sanity tests: julia --project scripts/alphazero.jl bonbon-rectangle check-game
+11/04/2021
+Adaptation to AlphaZero.jl v0.4 for Julia 1.6
+Passed all sanity tests in julia --project scripts/alphazero.jl bonbon-rectangle check-game
 
 07/02/2021
 Minmax baseline player can use a branch-cutting heuristic based on the most impactful bonbons to chose moves from.

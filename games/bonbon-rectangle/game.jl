@@ -14,8 +14,6 @@ const INITIAL_BOARD_SIZE_16_LIST = [
   "10C7F", "144BB", "180F3"
 ]
 
-const USE_HEURISTIC = true
-
 const Player = UInt8
 const WHITE = 0x01
 const BLACK = 0x02
